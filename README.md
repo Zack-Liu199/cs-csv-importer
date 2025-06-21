@@ -1,2 +1,23 @@
-# es-csv-data--generator
-# es-csv-data--generator
+# cs-csv-importer
+
+### ES选型
+
+Elasticsearch 7.10.2 是一个很好的选择，尤其适合您当前的环境和需求。以下是详细分析和补充建议：
+
+### **版本评估**
+
+1. **兼容性**
+
+- - **JDK 1.8.192**：ES 7.10.2 是最后一个官方支持 Java 8 的版本，完美匹配您现有的 JDK 环境，无需升级 Java。
+- **长期支持 (LTS)**：虽然 7.10.x 不是 Elastic 官方标注的 LTS 版本，但它是 7.x 系列中维护时间最长的版本之一，稳定性和安全性有保障。
+
+1. **功能特性**
+
+- - 包含 **_search_shards API**、**Field Collapsing** 等高性能检索优化功能。
+- 支持 **ILM (Index Lifecycle Management)**，方便管理百亿级数据的索引生命周期。
+- 引入 **EQL (Elastic Query Language)**，增强复杂查询能力。
+
+1. **性能优化**
+
+- - 相比 7.17.x 等后续版本，7.10.2 的资源占用更低，更适合您 32GB 内存的节点配置。
+- 针对大规模数据检索的优化已成熟（如分片分配算法、查询缓存机制）。
