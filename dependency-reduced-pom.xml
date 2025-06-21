@@ -32,7 +32,7 @@
             <configuration>
               <transformers>
                 <transformer>
-                  <mainClass>CsvToEsImporter</mainClass>
+                  <mainClass>com.example.CsvToEsImporter</mainClass>
                 </transformer>
                 <transformer />
               </transformers>
