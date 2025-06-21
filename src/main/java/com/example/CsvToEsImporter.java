@@ -137,7 +137,7 @@ public class CsvToEsImporter {
             request.mapping("{\n" +
                     "  \"properties\": {\n" +
                     "    \"id\": {\"type\": \"keyword\"},\n" +
-                    "    \"name\": {\"type\": \"text\", \"analyzer\": \"ik_max_word\"}\n" +
+                    "    \"姓名\": {\"type\": \"text\", \"analyzer\": \"ik_max_word\"}\n" +
                     "  }\n" +
                     "}", XContentType.JSON);
 
