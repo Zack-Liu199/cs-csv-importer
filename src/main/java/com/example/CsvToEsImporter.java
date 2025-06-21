@@ -5,6 +5,7 @@ import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.client.CredentialsProvider;
 import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.elasticsearch.action.bulk.BackoffPolicy;
 import org.elasticsearch.action.bulk.BulkProcessor;
 import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkResponse;
@@ -14,20 +15,26 @@ import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestHighLevelClient;
 import org.elasticsearch.client.indices.CreateIndexRequest;
 import org.elasticsearch.client.indices.GetIndexRequest;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.xcontent.XContentType;
 import org.supercsv.io.CsvMapReader;
 import org.supercsv.io.ICsvMapReader;
 import org.supercsv.prefs.CsvPreference;
 
-import java.io.*;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.*;
+import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
+import java.io.*;
+import java.util.*;
 
 public class CsvToEsImporter {
     private static Properties config;
@@ -40,16 +47,27 @@ public class CsvToEsImporter {
         String configPath = args.length > 0 ? args[0] : "config.properties";
         config = loadConfig(configPath);
 
-        // 从配置中获取参数
+        // 从配置中获取参数（补充缺失的配置项）
         String esHostsStr = config.getProperty("es.hosts", "localhost:9200");
         String indexName = config.getProperty("es.index.name", "person_data");
         String username = config.getProperty("es.username");
         String password = config.getProperty("es.password");
-        int batchSize = Integer.parseInt(config.getProperty("batch.size", "5000"));
-        int flushInterval = Integer.parseInt(config.getProperty("flush.interval", "10"));
-        long bulkSizeMB = Long.parseLong(config.getProperty("bulk.size.mb", "10"));
-        int concurrentThreads = Integer.parseInt(config.getProperty("thread.count", "5"));
+
+        // 批量处理核心参数
+        int batchSize = Integer.parseInt(config.getProperty("batch.size", "50000"));
+        int flushInterval = Integer.parseInt(config.getProperty("flush.interval.seconds", "30"));
+        long bulkSizeMB = Long.parseLong(config.getProperty("bulk.size.mb", "20"));
+        int concurrentRequests = Integer.parseInt(config.getProperty("concurrent.requests", "2"));
         int maxRetries = Integer.parseInt(config.getProperty("max.retries", "3"));
+        int retryDelayMillis = Integer.parseInt(config.getProperty("retry.delay.millis", "1000"));
+
+        // 线程池配置（补充您已有的thread.count参数映射）
+        int threadCount = Integer.parseInt(config.getProperty("thread.count", "5"));
+
+        // 高级索引配置（可选）
+        String refreshInterval = config.getProperty("index.refresh_interval", "1s");
+        int numberOfShards = Integer.parseInt(config.getProperty("index.number_of_shards", "5"));
+        int numberOfReplicas = Integer.parseInt(config.getProperty("index.number_of_replicas", "1"));
 
         // 读取CSV文件路径
         String csvDirPath = config.getProperty("csv.dir");
@@ -62,9 +80,22 @@ public class CsvToEsImporter {
         try {
             // 初始化ES客户端和BulkProcessor
             client = createEsClient(esHostsStr, username, password);
-            ensureIndexExists(client, indexName);
-            initBulkProcessor(client, indexName, batchSize, flushInterval, bulkSizeMB, maxRetries);
 
+            // 修正：传递所有参数给ensureIndexExists
+            ensureIndexExists(client, indexName, numberOfShards, numberOfReplicas, refreshInterval);
+
+            // 修正：获取BulkProcessor实例并保存到类变量
+            bulkProcessor = initBulkProcessor(
+                    client,
+                    indexName,
+                    batchSize,
+                    flushInterval,
+                    bulkSizeMB,
+                    maxRetries,
+                    retryDelayMillis,
+                    concurrentRequests
+            );
+            int concurrentThreads = Integer.parseInt(config.getProperty("thread.count", "5"));
             // 多线程处理CSV文件（控制并发数避免内存压力）
             ExecutorService executor = Executors.newFixedThreadPool(concurrentThreads);
             for (Path csvFile : csvFiles) {
@@ -124,15 +155,18 @@ public class CsvToEsImporter {
         );
     }
 
-    // 确保索引存在
-    private static void ensureIndexExists(RestHighLevelClient client, String indexName) throws IOException {
+    // 确保索引存在（优化：支持动态配置分片、副本和刷新间隔）
+    private static void ensureIndexExists(RestHighLevelClient client, String indexName,
+                                          int numberOfShards, int numberOfReplicas, String refreshInterval) throws IOException {
         if (!client.indices().exists(new GetIndexRequest(indexName), RequestOptions.DEFAULT)) {
             CreateIndexRequest request = new CreateIndexRequest(indexName);
+
+            // 使用参数化配置替代硬编码
             request.settings("{\n" +
-                    "  \"number_of_shards\": 5,\n" +
-                    "  \"number_of_replicas\": 0,\n" +  // 导入时设为0提升性能
-                    "  \"refresh_interval\": -1\n" +  // 临时禁用刷新
-                    "}", XContentType.JSON);  // 修正：补充闭合的引号和大括号
+                    "  \"number_of_shards\": " + numberOfShards + ",\n" +
+                    "  \"number_of_replicas\": " + numberOfReplicas + ",\n" +
+                    "  \"refresh_interval\": \"" + refreshInterval + "\"\n" +  // 修正引号问题
+                    "}", XContentType.JSON);
 
             request.mapping("{\n" +
                     "  \"properties\": {\n" +
@@ -146,9 +180,10 @@ public class CsvToEsImporter {
         }
     }
 
-    // 初始化BulkProcessor（关键优化点）
-    private static void initBulkProcessor(RestHighLevelClient client, String indexName,
-                                          int batchSize, int flushInterval, long bulkSizeMB, int maxRetries) {
+    // 初始化BulkProcessor（优化：添加缺失的参数支持）
+    private static BulkProcessor initBulkProcessor(RestHighLevelClient client, String indexName,
+                                                   int batchSize, int flushInterval, long bulkSizeMB,
+                                                   int maxRetries, int retryDelayMillis, int concurrentRequests) {
         BulkProcessor.Listener listener = new BulkProcessor.Listener() {
             @Override
             public void beforeBulk(long executionId, BulkRequest request) {
@@ -171,8 +206,8 @@ public class CsvToEsImporter {
             }
         };
 
-        bulkProcessor = BulkProcessor.builder(
-                        // 修正：使用RequestOptions.DEFAULT并传递完整的lambda表达式
+        // 修复：返回BulkProcessor实例，而不是void
+        return BulkProcessor.builder(
                         (request, bulkListener) -> client.bulkAsync(
                                 request,
                                 RequestOptions.DEFAULT,
@@ -181,12 +216,12 @@ public class CsvToEsImporter {
                         listener
                 )
                 .setBulkActions(batchSize)
-                .setBulkSize(new org.elasticsearch.common.unit.ByteSizeValue(bulkSizeMB, org.elasticsearch.common.unit.ByteSizeUnit.MB))
-                .setFlushInterval(org.elasticsearch.common.unit.TimeValue.timeValueSeconds(flushInterval))
-                .setConcurrentRequests(1)
+                .setBulkSize(new ByteSizeValue(bulkSizeMB, ByteSizeUnit.MB))
+                .setFlushInterval(TimeValue.timeValueSeconds(flushInterval))
+                .setConcurrentRequests(concurrentRequests)  // 使用传入的参数
                 .setBackoffPolicy(
-                        org.elasticsearch.action.bulk.BackoffPolicy.exponentialBackoff(
-                                org.elasticsearch.common.unit.TimeValue.timeValueMillis(100),
+                        BackoffPolicy.exponentialBackoff(
+                                TimeValue.timeValueMillis(retryDelayMillis),  // 使用传入的参数
                                 maxRetries
                         )
                 )
